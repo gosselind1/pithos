@@ -18,182 +18,74 @@ import os
 from urllib.parse import splittype, splituser, splitpasswd
 
 import gi
-gi.require_version('Secret', '1')
 from gi.repository import (
     GLib,
-    Secret,
     Gtk
 )
+import keyring.errors
+import keyring
 
 
 class _SecretService:
 
-    _account_schema = Secret.Schema.new(
-        'io.github.Pithos.Account',
-        Secret.SchemaFlags.NONE,
-        {'email': Secret.SchemaAttributeType.STRING},
-    )
+    _SERVICE_NAME = 'io.github.Pithos.Account'
 
     def __init__(self):
-        self._current_collection = Secret.COLLECTION_DEFAULT
+        pass  # as collections have been passed off to secrets, this shouldn't need to track anything
 
-    def unlock_keyring(self, callback):
-        # Inside of flatpak we only have access to the simple API.
-        if is_flatpak():
-            callback(None)
-            return
+    @staticmethod
+    def unlock_keyring(callback):
+        """
+        Name is somewhat misleading now.
+        Serves as a keyring initializer rather than a gtk secret1 unlocker now.
+        """
 
-        def on_unlock_finish(source, result, data):
-            service, default_collection = data
-            try:
-                num_items, unlocked = service.unlock_finish(result)
-            except GLib.Error as e:
-                logging.error('Error on service.unlock, Error: {}'.format(e))
-                callback(e)
-            else:
-                if not num_items or default_collection not in unlocked:
-                    self._current_collection = Secret.COLLECTION_SESSION
-                    logging.debug('The default keyring is still locked. Using session collection.')
-                else:
-                    logging.debug('The default keyring was unlocked.')
-                callback(None)
+        try:
+            logging.debug('Keyring backend: {}'.format(keyring.get_keyring().name))
+        except keyring.errors.InitError as e:
+            logging.error('Failed to init keyring, Error: {}'.format(e))
 
-        def on_for_alias_finish(source, result, service):
-            try:
-                default_collection = Secret.Collection.for_alias_finish(result)
-            except GLib.Error as e:
-                logging.error('Error getting Secret.COLLECTION_DEFAULT, Error: {}'.format(e))
-                callback(e)
-            else:
-                if default_collection is None:
-                    logging.warning(
-                        'Could not get the default Secret Collection.\n'
-                        'Attempting to use the session Collection.'
-                    )
-
-                    self._current_collection = Secret.COLLECTION_SESSION
-                    callback(None)
-
-                elif default_collection.get_locked():
-                    logging.debug('The default keyring is locked.')
-                    service.unlock(
-                        [default_collection],
-                        None,
-                        on_unlock_finish,
-                        (service, default_collection),
-                    )
-
-                else:
-                    logging.debug('The default keyring is unlocked.')
-                    callback(None)
-
-        def on_get_finish(source, result, data):
-            try:
-                service = Secret.Service.get_finish(result)
-            except GLib.Error as e:
-                logging.error('Failed to get Secret.Service, Error: {}'.format(e))
-                callback(e)
-            else:
-                Secret.Collection.for_alias(
-                    service,
-                    Secret.COLLECTION_DEFAULT,
-                    Secret.CollectionFlags.NONE,
-                    None,
-                    on_for_alias_finish,
-                    service,
-                )
-
-        Secret.Service.get(
-            Secret.ServiceFlags.NONE,
-            None,
-            on_get_finish,
-            None,
-        )
+        callback(None)
 
     def get_account_password(self, email, callback):
-        def on_password_lookup_finish(_, result):
-            try:
-                password = Secret.password_lookup_finish(result) or ''
-                callback(password)
-            except GLib.Error as e:
-                logging.error('Failed to lookup password async, Error: {}'.format(e))
-                callback('')
+        password = ''
 
-        # The async version of this hangs forever in flatpak and its been broken for years
-        # so for now lets just use the sync version as it works.
-        if is_flatpak():
-            try:
-                password = Secret.password_lookup_sync(
-                    self._account_schema,
-                    {'email': email},
-                    None,
-                ) or ''
-                callback(password)
-            except GLib.Error as e:
-                logging.error('Failed to lookup password sync, Error: {}'.format(e))
-                callback('')
-            return
+        try:
+            password = keyring.get_password(self._SERVICE_NAME, email) or ''
+        except keyring.errors.KeyringError as e:
+            logging.error('Failed to lookup password, Error: {}'.format(e))
 
-        Secret.password_lookup(
-            self._account_schema,
-            {'email': email},
-            None,
-            on_password_lookup_finish,
-        )
+        finally:
+            callback(password)
 
     def set_account_password(self, old_email, new_email, password, callback):
-        def on_password_store_finish(source, result, data):
-            try:
-                success = Secret.password_store_finish(result)
-            except GLib.Error as e:
-                logging.error('Failed to store password, Error: {}'.format(e))
-                success = False
-            if callback:
-                callback(success)
-
-        def on_password_clear_finish(source, result, data):
-            try:
-                password_removed = Secret.password_clear_finish(result)
-                if password_removed:
-                    logging.debug('Cleared password for: {}'.format(old_email))
-                else:
-                    logging.debug('No password found to clear for: {}'.format(old_email))
-            except GLib.Error as e:
-                logging.error('Failed to clear password for: {}, Error: {}'.format(old_email, e))
-                if callback:
-                    callback(False)
-            else:
-                Secret.password_store(
-                    self._account_schema,
-                    {'email': new_email},
-                    self._current_collection,
-                    'Pandora Account',
-                    password,
-                    None,
-                    on_password_store_finish,
-                    None,
-                )
+        """
+        Attempts to set an account password.
+        Deletes the previously stored password if the new email does not match the previously stored one.
+        """
+        success = True
 
         if old_email and old_email != new_email:
-            Secret.password_clear(
-                self._account_schema,
-                {'email': old_email},
-                None,
-                on_password_clear_finish,
-                None,
-            )
+            try:
+                keyring.delete_password(self._SERVICE_NAME, old_email)
+                logging.debug('Cleared password for: {}'.format(old_email))
 
-        else:
-            Secret.password_store(
-                self._account_schema,
-                {'email': new_email},
-                self._current_collection,
-                'Pandora Account',
-                password,
-                None,
-                on_password_store_finish,
-                None,
-            )
+            except keyring.errors.PasswordDeleteError as e:
+                logging.debug('Failed to clear password for: {}, Clear Error: {}'.format(old_email, e))
+
+            except keyring.errors.KeyringError as e:
+                logging.error('Failed to clear password for: {}, Critical Error: {}'.format(old_email, e))
+                success = False
+
+        try:
+            keyring.set_password(self._SERVICE_NAME, new_email, password)
+
+        except keyring.errors.KeyringError as e:
+            logging.error('Failed to store password, Error: {}'.format(e))
+            success = False
+
+        if callback:
+            callback(success)
 
 
 SecretService = _SecretService()
