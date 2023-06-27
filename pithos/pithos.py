@@ -43,7 +43,7 @@ from .gobject_worker import GObjectWorker
 from .pandora import *
 from .pandora.data import *
 from .plugin import load_plugins
-from .util import parse_proxy, open_browser, popup_at_pointer, is_flatpak
+from .util import parse_proxy, open_browser, popup_at_pointer, is_flatpak, is_windows
 from .Secrets import SecretService
 from .migrate_settings import maybe_migrate_settings
 
@@ -370,6 +370,8 @@ class PithosWindow(Gtk.ApplicationWindow):
             if is_flatpak():
                 # However in flatpak that path is not readable by the host.
                 tempdir_base = os.path.join(GLib.get_user_cache_dir(), 'tmp')
+            elif is_windows():
+                tempdir_base = tempfile.gettempdir()
             self.tempdir = tempfile.TemporaryDirectory(prefix='pithos-', dir=tempdir_base, ignore_cleanup_errors=True)
             logging.info("Created temporary directory {}".format(self.tempdir.name))
         except IOError as e:
